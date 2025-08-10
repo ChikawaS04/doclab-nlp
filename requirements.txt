@@ -1,0 +1,7 @@
+﻿flask
+flask-cors
+spacy
+pdfplumber
+pytesseract
+python-docx
+werkzeug
