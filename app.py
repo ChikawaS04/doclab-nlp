@@ -94,12 +94,16 @@ def process():
     summary = summarize(text)
     extracted = extract_fields(text)
 
-    return jsonify(
-        docType=doc_type,
-        title=title[:200],
-        summary=summary,
-        extractedFields=extracted
-    ), 200
+    return jsonify({
+        "docType": doc_type,  # e.g., "pdf|docx|txt"
+        "entities": extracted,  # your extracted fields in format: [{"text": "John", "label": "PERSON"}]
+        "pages": 1,  # you can calculate this or default to 1
+        "meta": {
+            "filename": filename,
+            "size": len(raw)  # file size in bytes
+        },
+        "summary": summary if summary else ""  # optional summary
+    }), 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
