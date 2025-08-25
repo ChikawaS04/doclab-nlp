@@ -52,11 +52,17 @@ def normalize_text(s: str) -> str:
 
 def summarize(text: str, max_sentences: int = 4, max_chars: int = 1200) -> str:
     """
-    Frequency-based extractive summary.
-    Returns up to `max_sentences` sentences, capped at `max_chars`.
+    Frequency-based extractive summary for legal/financial documents.
+    Returns up to `max_sentences` sentences, capped at `max_chars`, prioritizing key sections.
     """
     if not text:
         return ""
+
+    import spacy
+    try:
+        nlp = spacy.load("en_core_web_sm")
+    except AttributeError:
+        return text[:max_chars]  # Fallback if spaCy not available
 
     doc = nlp(text)
 
@@ -65,7 +71,18 @@ def summarize(text: str, max_sentences: int = 4, max_chars: int = 1200) -> str:
     if not sents:
         return text[:max_chars]
 
-    # Build a frequency table for content words
+    # Define keywords for legal/financial sections (generic)
+    section_keywords = {
+        "parties": ["party", "parties", "disclosing", "receiving", "company", "entity"],
+        "purpose": ["purpose", "objective", "collaboration", "evaluation"],
+        "confidential": ["confidential", "information", "data", "materials", "trade secret"],
+        "obligations": ["agree", "duty", "obligation", "maintain", "protect"],
+        "term": ["term", "duration", "effective", "expiration", "termination"],
+        "governing": ["governing", "law", "jurisdiction", "state", "country"],
+        "signatures": ["signature", "execute", "date", "witness", "agreement"]
+    }
+
+    # Build a frequency table for content words, boosting section-specific terms
     freqs = {}
     for token in doc:
         if (
@@ -78,6 +95,10 @@ def summarize(text: str, max_sentences: int = 4, max_chars: int = 1200) -> str:
             continue
         key = token.lemma_.lower()
         freqs[key] = freqs.get(key, 0) + 1
+        # Boost frequency for section-related keywords
+        for section, keywords in section_keywords.items():
+            if key in keywords:
+                freqs[key] *= 2  # Double weight for relevance
 
     if not freqs:
         # Fallback: first few sentences
@@ -95,16 +116,22 @@ def summarize(text: str, max_sentences: int = 4, max_chars: int = 1200) -> str:
     for k in freqs:
         freqs[k] = freqs[k] / max_f
 
-    # Score each sentence by normalized sum of token freqs (and length penalty)
+    # Score each sentence by normalized sum of token freqs (with section priority)
     scored = []
     for idx, s in enumerate(sents):
         tokens = [t for t in s if t.lemma_.lower() in freqs]
         if not tokens:
             continue
         score = sum(freqs[t.lemma_.lower()] for t in tokens)
-        # mild length normalization: divide by log(len(tokens)+1)
+        # Apply length normalization and section boost
         denom = max(1.0, (len(tokens)) ** 0.85)
-        scored.append((idx, score / denom, s.text.strip()))
+        # Boost score if sentence contains section keywords
+        section_boost = 1.0
+        for section, keywords in section_keywords.items():
+            if any(k in [t.lemma_.lower() for t in s] for k in keywords):
+                section_boost = 1.5
+                break
+        scored.append((idx, score * section_boost / denom, s.text.strip()))
 
     if not scored:
         return (sents[0].text + " " + (sents[1].text if len(sents) > 1 else "")).strip()[:max_chars]
@@ -113,11 +140,17 @@ def summarize(text: str, max_sentences: int = 4, max_chars: int = 1200) -> str:
     scored.sort(key=lambda x: x[1], reverse=True)
     chosen = sorted(scored[:max_sentences], key=lambda x: x[0])
 
-    # Enforce char cap without cutting sentences mid-word
+    # Enforce char cap without cutting sentences mid-word, ensuring section coverage
     out = []
     total = 0
     for _, _, s_text in chosen:
+        # Check if adding this sentence exceeds limit
         if total + len(s_text) + (1 if out else 0) > max_chars:
+            # Try to include at least one sentence per major section if possible
+            if any(any(k in s_text.lower() for k in keywords) for keywords in section_keywords.values()):
+                if total + len(s_text) <= 2000:  # Allow up to 2000 as a soft cap
+                    out.append(s_text)
+                    total += len(s_text) + (1 if out else 0)
             break
         out.append(s_text)
         total += len(s_text) + (1 if out else 0)
