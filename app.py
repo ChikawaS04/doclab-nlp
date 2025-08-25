@@ -50,14 +50,14 @@ def normalize_text(s: str) -> str:
             .replace("\u00A0", " ")  # non-breaking space
             ).strip()
 
-def summarize(text: str, max_sentences: int = 2) -> str:
+def summarize(text: str, max_sentences: int = 8, max_chars: int = 4000) -> str:
     if not text:
         return ""
     doc = nlp(text)
     sents = [s.text.strip() for s in doc.sents if s.text.strip()]
     if not sents:
-        return text[:280]
-    return " ".join(sents[:max_sentences])[:1000]
+        return text[:max_chars]
+    return " ".join(sents[:max_sentences])[:max_chars]
 
 def extract_fields(text: str):
     fields = []
