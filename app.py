@@ -50,14 +50,84 @@ def normalize_text(s: str) -> str:
             .replace("\u00A0", " ")  # non-breaking space
             ).strip()
 
-def summarize(text: str, max_sentences: int = 8, max_chars: int = 4000) -> str:
+def summarize(text: str, max_sentences: int = 4, max_chars: int = 1200) -> str:
+    """
+    Frequency-based extractive summary.
+    Returns up to `max_sentences` sentences, capped at `max_chars`.
+    """
     if not text:
         return ""
+
     doc = nlp(text)
-    sents = [s.text.strip() for s in doc.sents if s.text.strip()]
+
+    # Collect sentences (strip empties)
+    sents = [s for s in doc.sents if s.text.strip()]
     if not sents:
         return text[:max_chars]
-    return " ".join(sents[:max_sentences])[:max_chars]
+
+    # Build a frequency table for content words
+    freqs = {}
+    for token in doc:
+        if (
+                token.is_stop
+                or token.is_punct
+                or token.like_num
+                or token.is_space
+                or not token.text.strip()
+        ):
+            continue
+        key = token.lemma_.lower()
+        freqs[key] = freqs.get(key, 0) + 1
+
+    if not freqs:
+        # Fallback: first few sentences
+        out = []
+        for s in sents:
+            if len(" ".join(out)) + len(s.text) > max_chars:
+                break
+            out.append(s.text.strip())
+            if len(out) >= max_sentences:
+                break
+        return " ".join(out)
+
+    # Normalize frequencies
+    max_f = max(freqs.values())
+    for k in freqs:
+        freqs[k] = freqs[k] / max_f
+
+    # Score each sentence by normalized sum of token freqs (and length penalty)
+    scored = []
+    for idx, s in enumerate(sents):
+        tokens = [t for t in s if t.lemma_.lower() in freqs]
+        if not tokens:
+            continue
+        score = sum(freqs[t.lemma_.lower()] for t in tokens)
+        # mild length normalization: divide by log(len(tokens)+1)
+        denom = max(1.0, (len(tokens)) ** 0.85)
+        scored.append((idx, score / denom, s.text.strip()))
+
+    if not scored:
+        return (sents[0].text + " " + (sents[1].text if len(sents) > 1 else "")).strip()[:max_chars]
+
+    # Pick top-N by score, then restore original order
+    scored.sort(key=lambda x: x[1], reverse=True)
+    chosen = sorted(scored[:max_sentences], key=lambda x: x[0])
+
+    # Enforce char cap without cutting sentences mid-word
+    out = []
+    total = 0
+    for _, _, s_text in chosen:
+        if total + len(s_text) + (1 if out else 0) > max_chars:
+            break
+        out.append(s_text)
+        total += len(s_text) + (1 if out else 0)
+
+    # If we somehow added nothing (extreme short cap), take the best single sentence
+    if not out:
+        out = [scored[0][2][:max_chars]]
+
+    return " ".join(out)
+
 
 def extract_fields(text: str):
     fields = []
