@@ -50,116 +50,129 @@ def normalize_text(s: str) -> str:
             .replace("\u00A0", " ")  # non-breaking space
             ).strip()
 
-def summarize(text: str, max_sentences: int = 4, max_chars: int = 1200) -> str:
+SECTION_KEYWORDS = {
+    "parties": {"party", "parties", "disclosing", "receiving", "company", "entity"},
+    "purpose": {"purpose", "objective", "collaboration", "evaluation"},
+    "confidential": {"confidential", "information", "data", "materials", "trade", "secret"},
+    "obligations": {"agree", "duty", "obligation", "maintain", "protect", "disclose"},
+    "term": {"term", "duration", "effective", "expiration", "terminate", "termination"},
+    "governing": {"governing", "law", "jurisdiction", "state", "country"},
+    "signatures": {"signature", "execute", "date", "witness", "agreement"}
+}
+
+def summarize(text: str, max_sentences: int = 5, max_chars: int = 1400) -> str:
     """
-    Frequency-based extractive summary for legal/financial documents.
-    Returns up to `max_sentences` sentences, capped at `max_chars`, prioritizing key sections.
+    Frequency-based extractive summary tuned for legal/financial docs.
+    Ensures (best-effort) section coverage, normalized by sentence length,
+    and capped to `max_chars`.
     """
     if not text:
         return ""
 
-    import spacy
-    try:
-        nlp = spacy.load("en_core_web_sm")
-    except AttributeError:
-        return text[:max_chars]  # Fallback if spaCy not available
-
     doc = nlp(text)
 
-    # Collect sentences (strip empties)
+    # Collect non-empty sentences
     sents = [s for s in doc.sents if s.text.strip()]
     if not sents:
         return text[:max_chars]
 
-    # Define keywords for legal/financial sections (generic)
-    section_keywords = {
-        "parties": ["party", "parties", "disclosing", "receiving", "company", "entity"],
-        "purpose": ["purpose", "objective", "collaboration", "evaluation"],
-        "confidential": ["confidential", "information", "data", "materials", "trade secret"],
-        "obligations": ["agree", "duty", "obligation", "maintain", "protect"],
-        "term": ["term", "duration", "effective", "expiration", "termination"],
-        "governing": ["governing", "law", "jurisdiction", "state", "country"],
-        "signatures": ["signature", "execute", "date", "witness", "agreement"]
-    }
-
-    # Build a frequency table for content words, boosting section-specific terms
-    freqs = {}
-    for token in doc:
-        if (
-                token.is_stop
-                or token.is_punct
-                or token.like_num
-                or token.is_space
-                or not token.text.strip()
-        ):
+    # Build frequency table on lemmas (skip stop/punct/nums)
+    freqs: dict[str, float] = {}
+    for t in doc:
+        if t.is_stop or t.is_punct or t.like_num or t.is_space:
             continue
-        key = token.lemma_.lower()
-        freqs[key] = freqs.get(key, 0) + 1
-        # Boost frequency for section-related keywords
-        for section, keywords in section_keywords.items():
-            if key in keywords:
-                freqs[key] *= 2  # Double weight for relevance
+        lemma = t.lemma_.lower().strip()
+        if not lemma:
+            continue
+        freqs[lemma] = freqs.get(lemma, 0.0) + 1.0
 
     if not freqs:
-        # Fallback: first few sentences
         out = []
         for s in sents:
-            if len(" ".join(out)) + len(s.text) > max_chars:
+            nxt = ("" if not out else " ") + s.text.strip()
+            if len("".join(out)) + len(nxt) > max_chars or len(out) >= max_sentences:
                 break
-            out.append(s.text.strip())
-            if len(out) >= max_sentences:
-                break
-        return " ".join(out)
+            out.append(nxt)
+        return "".join(out)
 
-    # Normalize frequencies
     max_f = max(freqs.values())
-    for k in freqs:
-        freqs[k] = freqs[k] / max_f
+    for k in list(freqs):
+        freqs[k] /= max_f  # normalize to [0,1]
 
-    # Score each sentence by normalized sum of token freqs (with section priority)
-    scored = []
+    # Precompute sentence keyword hits + scores
+    scored = []  # (idx, score, text, sections_hit:set)
     for idx, s in enumerate(sents):
-        tokens = [t for t in s if t.lemma_.lower() in freqs]
-        if not tokens:
+        lemmas = [t.lemma_.lower() for t in s if not (t.is_stop or t.is_punct or t.like_num or t.is_space)]
+        if not lemmas:
             continue
-        score = sum(freqs[t.lemma_.lower()] for t in tokens)
-        # Apply length normalization and section boost
-        denom = max(1.0, (len(tokens)) ** 0.85)
-        # Boost score if sentence contains section keywords
-        section_boost = 1.0
-        for section, keywords in section_keywords.items():
-            if any(k in [t.lemma_.lower() for t in s] for k in keywords):
-                section_boost = 1.5
-                break
-        scored.append((idx, score * section_boost / denom, s.text.strip()))
+
+        base_score = sum(freqs.get(l, 0.0) for l in lemmas)
+        length_norm = max(1.0, len(lemmas) ** 0.85)
+
+        sections_hit = set()
+        sent_lemmas = set(lemmas)
+        for sec, kws in SECTION_KEYWORDS.items():
+            if sent_lemmas.intersection(kws):
+                sections_hit.add(sec)
+
+        # Boost if we hit any section keywords
+        boost = 1.3 if sections_hit else 1.0
+        score = (base_score / length_norm) * boost
+
+        scored.append((idx, score, s.text.strip(), sections_hit))
 
     if not scored:
-        return (sents[0].text + " " + (sents[1].text if len(sents) > 1 else "")).strip()[:max_chars]
+        # Safe fallback: first couple of sentences
+        txt = (sents[0].text + (" " + sents[1].text if len(sents) > 1 else "")).strip()
+        return txt[:max_chars]
 
-    # Pick top-N by score, then restore original order
+    # Sort high → low by score
     scored.sort(key=lambda x: x[1], reverse=True)
-    chosen = sorted(scored[:max_sentences], key=lambda x: x[0])
 
-    # Enforce char cap without cutting sentences mid-word, ensuring section coverage
-    out = []
-    total = 0
-    for _, _, s_text in chosen:
-        # Check if adding this sentence exceeds limit
-        if total + len(s_text) + (1 if out else 0) > max_chars:
-            # Try to include at least one sentence per major section if possible
-            if any(any(k in s_text.lower() for k in keywords) for keywords in section_keywords.values()):
-                if total + len(s_text) <= 2000:  # Allow up to 2000 as a soft cap
-                    out.append(s_text)
-                    total += len(s_text) + (1 if out else 0)
+    # 1) Try to cover sections: pick best sentence per section if available
+    chosen: list[tuple[int,float,str,set]] = []
+    seen_idx = set()
+    covered_sections = set()
+    for sec in SECTION_KEYWORDS.keys():
+        for tup in scored:
+            idx, _, txt, secs = tup
+            if idx in seen_idx:
+                continue
+            if sec in secs:
+                chosen.append(tup)
+                seen_idx.add(idx)
+                covered_sections.add(sec)
+                break
+        if len(chosen) >= max_sentences:
             break
-        out.append(s_text)
-        total += len(s_text) + (1 if out else 0)
 
-    # If we somehow added nothing (extreme short cap), take the best single sentence
-    if not out:
-        out = [scored[0][2][:max_chars]]
+    # 2) Fill remaining slots by score
+    for tup in scored:
+        if len(chosen) >= max_sentences:
+            break
+        idx = tup[0]
+        if idx not in seen_idx:
+            chosen.append(tup)
+            seen_idx.add(idx)
 
-    return " ".join(out)
+    # Restore original text order
+    chosen.sort(key=lambda x: x[0])
+
+    # 3) Pack into char budget
+    out_parts = []
+    total = 0
+    for _, _, txt, _ in chosen:
+        sep = "" if not out_parts else " "
+        if total + len(sep) + len(txt) > max_chars:
+            break
+        out_parts.append(sep + txt)
+        total += len(sep) + len(txt)
+
+    # Guarantee something
+    if not out_parts:
+        out_parts = [scored[0][2][:max_chars]]
+
+    return "".join(out_parts)
 
 
 def extract_fields(text: str):
