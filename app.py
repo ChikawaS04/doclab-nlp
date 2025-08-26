@@ -4,6 +4,7 @@ from typing import Tuple, List, Dict, Set
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import pdfplumber
+import re
 
 # --- spaCy (safe load with fallback) ---
 try:
@@ -33,40 +34,61 @@ CORS(app)
 # -----------------------------
 # Normalization & Text Helpers
 # -----------------------------
-def normalize_text(s: str) -> str:
-    """Fix common mojibake and normalize Unicode."""
+def fix_spacing(s: str) -> str:
+    """
+    Repairs common 'glued' text artifacts after PDF extraction while trying
+    not to mangle emails/URLs. Final pass collapses multi-spaces.
+    """
     if not s:
         return s
-    s = unicodedata.normalize("NFC", s)
-    replacements = {
-        "ΓÇô": "–", "â€“": "–", "â€”": "—", "ΓÇö": "—",
-        "â€˜": "‘", "â€™": "’", "â€œ": "“", "â€": "”",
-        "\u00A0": " ",
-    }
-    for bad, good in replacements.items():
-        s = s.replace(bad, good)
-    # collapse overly spaced content while preserving newlines
-    s = re.sub(r"[ \t]{2,}", " ", s)
-    return s.strip()
+
+    # Join hyphenated line-breaks: 'inter-\nnational' -> 'international'
+    s = re.sub(r'-\s*\n\s*', '', s)
+
+    # Turn hard line breaks into spaces (preserve paragraphs loosely)
+    s = re.sub(r'\s*\n\s*', ' ', s)
+
+    # Insert missing spaces after punctuation when the next char is a letter
+    # e.g., "amount,which" -> "amount, which"
+    s = re.sub(r'(?<=[,;:])(?=[A-Za-z])', ' ', s)
+
+    # Insert missing spaces between numbers and letters in both directions
+    # e.g., "123ABC" -> "123 ABC", "rate5percent" -> "rate 5 percent"
+    s = re.sub(r'(?<=\d)(?=[A-Za-z])', ' ', s)
+    s = re.sub(r'(?<=[A-Za-z])(?=\d)', ' ', s)
+
+    # Insert missing space after sentence period when next char is uppercase letter
+    # e.g., "Agreement.The" -> "Agreement. The"
+    s = re.sub(r'(?<=[A-Za-z0-9])\.(?=[A-Z])', '. ', s)
+
+    # Normalize weird encodings already seen (dashes, NBSP)
+    s = (s
+         .replace("ΓÇô", "–")
+         .replace("â€“", "–")
+         .replace("â€”", "—")
+         .replace("\u00A0", " "))
+
+    # Collapse any runs of whitespace to a single space
+    s = re.sub(r'[ \t]{2,}', ' ', s).strip()
+    return s
+
+def normalize_text(s: str) -> str:
+    if not s:
+        return s
+    return fix_spacing(s)
 
 # -----------------------------
 # File Readers
 # -----------------------------
-def read_pdf(bytes_data: bytes) -> Tuple[str, int]:
-    """Read text from PDF using pdfplumber with tolerant settings and a simple fallback."""
-    text_chunks: List[str] = []
-    pages_count = 0
+def read_pdf(bytes_data: bytes) -> tuple[str, int]:
+    text_chunks = []
     with pdfplumber.open(io.BytesIO(bytes_data)) as pdf:
-        pages_count = len(pdf.pages)
         for page in pdf.pages:
-            # More tolerant extraction; try multiple passes before giving up
-            text = page.extract_text(x_tolerance=2, y_tolerance=2) or ""
-            if not text.strip():
-                # try a slightly looser pass
-                text = page.extract_text(x_tolerance=3, y_tolerance=3) or ""
-            if text.strip():
-                text_chunks.append(text)
-    return ("\n".join(text_chunks).strip(), max(1, pages_count))
+            # Preserve more natural spacing/flow
+            t = page.extract_text(x_tolerance=2, y_tolerance=2, layout=True) or ""
+            if t.strip():
+                text_chunks.append(t)
+        return ("\n".join(text_chunks).strip(), len(pdf.pages))
 
 def read_docx(bytes_data: bytes) -> str:
     from docx import Document as DocxDocument
